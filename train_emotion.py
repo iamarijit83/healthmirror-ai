@@ -1,174 +1,182 @@
+import os
 import torch
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
-from models.emotion_model import EmotionCNN
-
-import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 from tqdm import tqdm
-import os
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score
+from collections import Counter
 
 # -------------------------
-# Hyperparameters
+# CONFIG
 # -------------------------
-BATCH_SIZE = 16
-LR = 0.0003
-EPOCHS = 10
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 32
+LR = 0.0001
+EPOCHS = 40
 
-print("Hyperparameters:")
-print(f"Batch Size: {BATCH_SIZE}, LR: {LR}, Epochs: {EPOCHS}")
+CHECKPOINT_PATH = "models/checkpoint.pth"
+BEST_MODEL_PATH = "models/best_emotion_model.pth"
 
-# -------------------------
-# Device
-# -------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+print(f"Using device: {DEVICE}")
 
 # -------------------------
-# Transforms
+# TRANSFORMS (Improved)
 # -------------------------
 train_transform = transforms.Compose([
-    transforms.Grayscale(),
-    transforms.Resize((224, 224)),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((48, 48)),
     transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor()
 ])
 
-test_transform = transforms.Compose([
-    transforms.Grayscale(),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
+val_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((48, 48)),
+    transforms.ToTensor()
 ])
 
 # -------------------------
-# Dataset
+# DATASET
 # -------------------------
 train_data = ImageFolder("data/fer2013/train", transform=train_transform)
-test_data = ImageFolder("data/fer2013/test", transform=test_transform)
+val_data = ImageFolder("data/fer2013/test", transform=val_transform)
 
 train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
+val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
 
 # -------------------------
-# Model
+# CLASS WEIGHTS (IMPORTANT)
 # -------------------------
-model = EmotionCNN().to(device)
-criterion = torch.nn.CrossEntropyLoss()
+labels = [label for _, label in train_data.samples]
+class_counts = Counter(labels)
+total = sum(class_counts.values())
+
+class_weights = []
+for i in range(len(class_counts)):
+    class_weights.append(total / class_counts[i])
+
+class_weights = torch.tensor(class_weights, dtype=torch.float).to(DEVICE)
+
+print("Class weights:", class_weights)
+
+# -------------------------
+# MODEL
+# -------------------------
+model = mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
+
+model.classifier[1] = torch.nn.Linear(model.last_channel, 7)
+
+# 🔥 FULL UNFREEZE (Phase 2)
+for param in model.parameters():
+    param.requires_grad = True
+
+model = model.to(DEVICE)
+
+# -------------------------
+# LOSS + OPTIMIZER
+# -------------------------
+criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-# -------------------------
-# Tracking
-# -------------------------
-train_losses = []
-train_accuracies = []
-val_accuracies = []
-
-best_accuracy = 0
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', patience=3, factor=0.5
+)
 
 # -------------------------
-# Training Loop
+# LOAD CHECKPOINT
 # -------------------------
-for epoch in range(EPOCHS):
-    model.train()
-    running_loss = 0
-    correct = 0
-    total = 0
+start_epoch = 0
+best_acc = 0
+
+if os.path.exists(CHECKPOINT_PATH):
+    print("🔁 Loading checkpoint...")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    start_epoch = checkpoint["epoch"] + 1
+    best_acc = checkpoint["best_acc"]
+
+# -------------------------
+# TRAIN LOOP
+# -------------------------
+for epoch in range(start_epoch, EPOCHS):
 
     print(f"\nEpoch {epoch+1}/{EPOCHS}")
 
+    model.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+
     for images, labels in tqdm(train_loader):
-        images, labels = images.to(device), labels.to(device)
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
 
         outputs = model(images)
         loss = criterion(outputs, labels)
 
         optimizer.zero_grad()
         loss.backward()
+
+        # 🔥 Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+
         optimizer.step()
 
-        running_loss += loss.item()
+        train_loss += loss.item()
 
-        _, predicted = torch.max(outputs, 1)
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == labels).sum().item()
         total += labels.size(0)
-        correct += (predicted == labels).sum().item()
 
-    epoch_loss = running_loss / len(train_loader)
-    epoch_acc = correct / total
-
-    train_losses.append(epoch_loss)
-    train_accuracies.append(epoch_acc)
-
-    print(f"Train Loss: {epoch_loss:.4f}, Train Accuracy: {epoch_acc:.4f}")
+    train_acc = correct / total
 
     # -------------------------
-    # Validation
+    # VALIDATION
     # -------------------------
     model.eval()
     all_preds = []
     all_labels = []
 
     with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to(device), labels.to(device)
+        for images, labels in val_loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
 
             outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
+            _, preds = torch.max(outputs, 1)
 
-            all_preds.extend(predicted.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
     val_acc = accuracy_score(all_labels, all_preds)
-    val_accuracies.append(val_acc)
+    f1 = f1_score(all_labels, all_preds, average="weighted")
 
-    print(f"Validation Accuracy: {val_acc:.4f}")
+    print(f"Train Acc: {train_acc:.4f}")
+    print(f"Val Acc: {val_acc:.4f}, F1: {f1:.4f}")
 
-    # Save best model
-    if val_acc > best_accuracy:
-        best_accuracy = val_acc
-        torch.save(model.state_dict(), "models/best_emotion_model.pth")
+    scheduler.step(val_acc)
+
+    # -------------------------
+    # SAVE BEST MODEL
+    # -------------------------
+    if val_acc > best_acc:
+        best_acc = val_acc
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
         print("✅ Best model saved")
 
-# -------------------------
-# Final Metrics
-# -------------------------
-precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
-recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
-f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    # -------------------------
+    # SAVE CHECKPOINT
+    # -------------------------
+    torch.save({
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "best_acc": best_acc
+    }, CHECKPOINT_PATH)
 
-print("\nFinal Evaluation Metrics:")
-print(f"Best Accuracy: {best_accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"F1 Score: {f1:.4f}")
-
-# Confusion Matrix
-cm = confusion_matrix(all_labels, all_preds)
-print("\nConfusion Matrix:")
-print(cm)
-
-# -------------------------
-# Save Graphs
-# -------------------------
-os.makedirs("outputs", exist_ok=True)
-
-plt.figure()
-plt.plot(train_losses)
-plt.title("Training Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.savefig("outputs/loss.png")
-
-plt.figure()
-plt.plot(train_accuracies, label="Train")
-plt.plot(val_accuracies, label="Validation")
-plt.legend()
-plt.title("Accuracy")
-plt.xlabel("Epoch")
-plt.ylabel("Accuracy")
-plt.savefig("outputs/accuracy.png")
-
-print("\nGraphs saved in outputs/")
-print("Training complete!")
+print("\n🔥 Training Complete")

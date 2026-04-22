@@ -4,3 +4,21 @@ __pycache__/
 outputs/
 data/
 .env
+
+# Model files
+*.pth
+*.pt
+
+# Training folders
+training/
+data/
+
+# Checkpoints
+models/checkpoint.pth
+
+# Python
+__pycache__/
+*.pyc
+
+# Env
+venv/
