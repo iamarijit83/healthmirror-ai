@@ -60,6 +60,26 @@ async def analyze(file: UploadFile = File(...)):
         physical = analyze_physical_health(signals)
 
         # -------------------------
+        # Step 5: Dynamic Confidence Calculation
+        # -------------------------
+        emotion_conf = emotion.get("confidence", 0.5)
+        mental_conf = mental.get("confidence", 0.7)
+        physical_conf = physical.get("confidence", 0.7)
+
+        # Weighted fusion
+        overall_conf = (
+            0.4 * emotion_conf +
+            0.3 * mental_conf +
+            0.3 * physical_conf
+        )
+
+        # Penalize if emotion is uncertain
+        if emotion_conf < 0.5:
+            overall_conf *= 0.9
+
+        overall_conf = round(min(max(overall_conf, 0), 1), 2)
+
+        # -------------------------
         # Final Response
         # -------------------------
         return {
@@ -68,7 +88,7 @@ async def analyze(file: UploadFile = File(...)):
             "mentalHealthInsights": mental,
             "physicalHealthInsights": physical,
             "confidenceScores": {
-                "overall": 0.85
+                "overall": overall_conf
             },
             "recommendations": [
                 "Maintain regular sleep schedule",
